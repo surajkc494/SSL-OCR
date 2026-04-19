@@ -1,190 +1,105 @@
+import os
 import torch
 import torch.nn as nn
-from models.ocr import Seq2SeqTransformer
-from models.vit import ViT
-import torchvision
-import matplotlib.pyplot as plt
-import numpy as np
 import torch.optim as optim
-from einops import rearrange
-import os
-import loadData
-from timeit import default_timer as timer
-import utils 
 from tqdm import tqdm
+
 from Config import Configs
-
-
+from loadData import all_data_loader
+from models.ocr import TeluguCTCModel
+from models.vit import ViT
+import utils
 
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-# get your configuration here:
-cfg = Configs().parse()
-train_type = cfg.train_type
-batch_size = cfg.batch_size
-patch_size = cfg.vit_patch_size
-image_size =  (cfg.img_height,cfg.img_width)
-pretrained_encoder_path = cfg.pretrained_encoder_path
-
-# here the name of the current eperiment
-EXPERIMENT = train_type + '_' + str(image_size[0])+'_'+str(image_size[1])+'_'+str(patch_size)
-os.system('rm -r  pred_logs/'+EXPERIMENT)
-
-
-# get the utils functions and variables
-labelDictionary = loadData.labelDictionary
-num_classes, letter2index, index2letter = labelDictionary()
-tokens = loadData.tokens
-num_tokens = loadData.num_tokens
-SRC_VOCAB_SIZE = 1
-TGT_VOCAB_SIZE = num_classes + num_tokens
-count_cer = utils.count_cer
-writePrediction = utils.writePrediction
-load_data_func = loadData.loadData
-all_data_loader = loadData.all_data_loader
-PAD_IDX = tokens['PAD_TOKEN']
+def build_model(cfg, num_classes):
+    vit_encoder = ViT(
+        image_size=(cfg.img_height, cfg.max_width),
+        patch_size=cfg.vit_patch_size,
+        num_classes=1000,
+        dim=768,
+        depth=6,
+        heads=8,
+        mlp_dim=2048,
+    )
+    return TeluguCTCModel(vit_encoder=vit_encoder, emb_size=768, num_classes=num_classes)
 
 
-# Build the dataloaders
-trainloader, validloader, _ = all_data_loader(batch_size)
+def maybe_load_pretrained_encoder(model, ckpt_path):
+    if not ckpt_path:
+        return
+    ckpt = torch.load(ckpt_path, map_location='cpu')
+    if isinstance(ckpt, dict) and 'state_dict' in ckpt:
+        ckpt = ckpt['state_dict']
 
-# Variables for the models size, those are for a "base" architecture
-NUM_ENCODER_LAYERS = 6
-NUM_DECODER_LAYERS = 6
-EMB_SIZE = 768
-NHEAD = 8
-FFN_HID_DIM = 768
-
-# Define the ViT encoder
-vit_encoder = ViT(
-    image_size = image_size,
-    patch_size = patch_size,
-    num_classes = 1000,
-    dim = EMB_SIZE,  
-    depth = NUM_ENCODER_LAYERS,  #6
-    heads = NHEAD,  #8
-    mlp_dim = 2048
-)
-
-# Define the Full Transformer with the previous ViT as encoder
-transformer = Seq2SeqTransformer(NUM_ENCODER_LAYERS, NUM_DECODER_LAYERS, EMB_SIZE,
-                                 NHEAD, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE, FFN_HID_DIM,custom_encoder=vit_encoder,device=DEVICE,use_stn = train_type == 'stn')
+    missing, unexpected = model.encoder.load_state_dict(ckpt, strict=False)
+    print(f'Loaded encoder from {ckpt_path}. Missing={len(missing)} Unexpected={len(unexpected)}')
 
 
-# Model weight initializations
-for p in transformer.parameters():
-    if p.dim() > 1:
-        nn.init.xavier_uniform_(p)
+def run_eval(model, loader, criterion, vocab):
+    model.eval()
+    losses = 0.0
+    all_preds, all_gts = [], []
+    with torch.no_grad():
+        for batch in tqdm(loader, desc='valid', leave=False):
+            images = batch['images'].to(DEVICE)
+            logits = model(images)
+            log_probs = torch.log_softmax(logits, dim=-1)
 
-transformer.transformer.encoder.load_state_dict(torch.load(pretrained_encoder_path))
+            input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long, device=DEVICE)
+            targets = batch['targets'].to(DEVICE)
+            target_lengths = batch['target_lengths'].to(DEVICE)
+            loss = criterion(log_probs, targets, input_lengths, target_lengths)
+            losses += loss.item()
 
-transformer = transformer.to(DEVICE)
-
-# Define the loss function
-loss_fn = torch.nn.CrossEntropyLoss(ignore_index=PAD_IDX)
-
-# Define the optimizer and scheduler
-optimizer = optim.Adam(transformer.parameters(),lr=1.5e-5, betas=(0.9, 0.95))  
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(trainloader))
-
-
-
-# Function to train one epoch
-def train_epoch(optimizer,sch=False):
-    transformer.train()
-    losses = 0
-    running_loss = 0.0
-    iters = 0
-    for i, (train_index, train_in, train_in_len, train_out) in enumerate(trainloader):
-        src = train_in.to(DEVICE)
-        tgt = train_out.to(DEVICE)
+            all_preds.extend(utils.ctc_greedy_decode_batch(log_probs, vocab))
+            all_gts.extend(batch['labels'])
+    cer, wer = utils.compute_word_and_cer(all_preds, all_gts, vocab)
+    return losses / max(1, len(loader)), cer, wer
 
 
-        tgt = rearrange(tgt, 'b t -> t b')
-        tgt_input = tgt[:-1, :]  
-        tgt_out = tgt[1:, :]
-        
-        logits = transformer(src, tgt_input, None, None, None, None, None)
+def main():
+    cfg = Configs().parse()
+    train_loader, valid_loader, _, vocab = all_data_loader(cfg.batch_size)
+    utils.validate_split_file(cfg.train_file, vocab)
 
-        optimizer.zero_grad()
-        loss = loss_fn(logits.reshape(-1, logits.shape[-1]), tgt_out.reshape(-1))
-        
-        loss.backward()
-        iters+=1
-        optimizer.step()
-        
-        if sch:
-            scheduler.step()
-	
-        losses += loss.item()
-        running_loss += loss.item()
-        
-        writePrediction(epoch, train_index, logits, 'train' , 'pred_logs/'+EXPERIMENT)
+    model = build_model(cfg, vocab.vocab_size + 1).to(DEVICE)
+    maybe_load_pretrained_encoder(model, cfg.pretrained_encoder_path)
 
-        show_every = int(len(trainloader) / 10) # Specify at which number of iterations to show the loss, you can save it to visualize also
-        if i % show_every == show_every-1:    
-            print('[epoch: %d, iter: %5d] Train. loss: %.3f' % (epoch, i + 1, running_loss / show_every))
-            running_loss = 0.0
-        
-    return losses / len(trainloader)
+    criterion = nn.CTCLoss(blank=vocab.blank_idx, reduction='mean', zero_infinity=True)
+    optimizer = optim.AdamW(model.parameters(), lr=cfg.lr)
 
+    best_cer = float('inf')
+    os.makedirs(cfg.weights_path, exist_ok=True)
 
-# Evaluate model on the validation set, count the CER, ACC  each epoch and save the best weights.
-def evaluate():
-    transformer.eval()
-    losses = 0
+    for epoch in range(1, cfg.epochs + 1):
+        model.train()
+        total = 0.0
+        for batch in tqdm(train_loader, desc=f'fine-tune epoch {epoch}', leave=False):
+            images = batch['images'].to(DEVICE)
+            logits = model(images)
+            log_probs = torch.log_softmax(logits, dim=-1)
+            input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long, device=DEVICE)
+            targets = batch['targets'].to(DEVICE)
+            target_lengths = batch['target_lengths'].to(DEVICE)
 
-    for i, (valid_index, valid_in, valid_in_len, valid_out) in enumerate(validloader):
+            loss = criterion(log_probs, targets, input_lengths, target_lengths)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total += loss.item()
 
-        src = valid_in.to(DEVICE)
-        tgt = valid_out.to(DEVICE)
-        
-        tgt = rearrange(tgt, 'b t -> t b')
-
-        tgt_input = tgt[:-1, :]
-        
-        with torch.no_grad():
-            logits = transformer(src, tgt_input, None, None, None, None, None)
-
-        tgt_out = tgt[1:, :]
-        loss = loss_fn(logits.reshape(-1, logits.shape[-1]), tgt_out.reshape(-1))
-        losses += loss.item()
-        
-        writePrediction(epoch, valid_index, logits, 'valid','pred_logs/'+EXPERIMENT)
-
-    
-    cer,wacc = count_cer('valid',epoch,"pred_logs/"+EXPERIMENT)
-    
-    print("Valid CER: ",cer)
-    print("Valid WACC: ",wacc)
-    print("Last Best Valid CER: ",best_cer[0], "Epoch: ",best_cer[1])
-    
-    
-    if cer<=best_cer[0]:
-        best_cer[0] = cer
-        best_cer[1] = epoch
-        if not os.path.exists('./weights/'):
-            os.makedirs('./weights/')
-        torch.save(transformer.state_dict(), './weights/best-seq2seq_'+EXPERIMENT+'.pt')
-    
-    return losses / len(validloader)
+        val_loss, val_cer, val_wer = run_eval(model, valid_loader, criterion, vocab)
+        print(
+            f'Epoch {epoch}: train_loss={total/max(1,len(train_loader)):.4f} '
+            f'val_loss={val_loss:.4f} CER={val_cer:.4f} WER={val_wer:.4f}'
+        )
+        if val_cer <= best_cer:
+            best_cer = val_cer
+            torch.save({'model_state_dict': model.state_dict()}, os.path.join(cfg.weights_path, 'best_finetune_telugu_ctc.pt'))
 
 
-if __name__ == "__main__":
-    st_epoch = 1
-    NUM_EPOCHS = 600
-    best_cer = [10,0] # this list is representing  [best_cer, best_epoch]
-    schd = False
-    
-    for epoch in range(st_epoch, NUM_EPOCHS+1):
-        start_time = timer()
-        
-        if epoch == 10: # 10 epochs for warmup
-            print('start scheduler !')
-            schd = True
-        train_loss = train_epoch(optimizer,schd)
-        end_time = timer()
-        val_loss = evaluate()
-        print((f"Epoch: {epoch}, Train loss: {train_loss:.3f}, Val loss: {val_loss:.3f}, "f"Epoch time = {(end_time - start_time):.3f}s"))
+if __name__ == '__main__':
+    main()
