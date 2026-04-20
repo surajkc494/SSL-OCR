@@ -1,160 +1,81 @@
+import os
+import sys
 import torch
 import torch.nn as nn
-from models.ocr import Seq2SeqTransformer
-from models.vit import ViT
-import torchvision
-import matplotlib.pyplot as plt
-import numpy as np
-import torch.optim as optim
-from einops import rearrange
-import os
-import loadData
-from timeit import default_timer as timer
-import utils 
 from tqdm import tqdm
+
 from Config import Configs
+from loadData import all_data_loader
+from models.ocr import TeluguCTCModel
+from models.vit import ViT
+import utils
 
-
-
-
+sys.stdout.reconfigure(encoding='utf-8')
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-# get your configuration here:
-cfg = Configs().parse()
-train_type = cfg.train_type
-batch_size = cfg.batch_size
-patch_size = cfg.vit_patch_size
-image_size =  (cfg.img_height,cfg.img_width)
-test_model = cfg.test_model
-
-# here the name of the current eperiment
-EXPERIMENT = 'test_'+train_type + '_' + str(image_size[0])+'_'+str(image_size[1])+'_'+str(patch_size)
-os.system('rm -r  pred_logs/'+EXPERIMENT)
-
-
-# get the utils functions and variables
-labelDictionary = loadData.labelDictionary
-num_classes, letter2index, index2letter = labelDictionary()
-tokens = loadData.tokens
-num_tokens = loadData.num_tokens
-SRC_VOCAB_SIZE = 1
-TGT_VOCAB_SIZE = num_classes + num_tokens
-count_cer = utils.count_cer
-writePrediction = utils.writePrediction
-load_data_func = loadData.loadData
-all_data_loader = loadData.all_data_loader
+def build_model(cfg, num_classes):
+    vit_encoder = ViT(
+        image_size=(cfg.img_height, cfg.max_width),
+        patch_size=cfg.vit_patch_size,
+        num_classes=1000,
+        dim=768,
+        depth=6,
+        heads=8,
+        mlp_dim=2048,
+    )
+    return TeluguCTCModel(vit_encoder=vit_encoder, emb_size=768, num_classes=num_classes)
 
 
-# Build the dataloader for testing
-_, _ , testloader = all_data_loader(batch_size)
+def main():
+    cfg = Configs().parse()
+    _, _, test_loader, vocab = all_data_loader(cfg_obj=cfg, batch_size=cfg.batch_size)
+
+    num_classes = vocab.vocab_size + 1
+    model = build_model(cfg, num_classes).to(DEVICE)
+
+    if not cfg.test_model:
+        raise ValueError('Please provide --test_model checkpoint path')
+
+    ckpt = torch.load(cfg.test_model, map_location=DEVICE)
+    state_dict = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
+    model.load_state_dict(state_dict)
+
+    criterion = nn.CTCLoss(blank=vocab.blank_idx, reduction='mean', zero_infinity=True)
+    model.eval()
+
+    predictions, ground_truths = [], []
+    total_loss = 0.0
+
+    pred_log = os.path.join('pred_logs', 'test_predictions.tsv')
+    if os.path.exists(pred_log):
+        os.remove(pred_log)
+
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc='test'):
+            images = batch['images'].to(DEVICE)
+            logits = model(images)
+            log_probs = torch.log_softmax(logits, dim=-1)
+
+            input_lengths = torch.full(
+                size=(images.size(0),), fill_value=log_probs.size(0), dtype=torch.long, device=DEVICE
+            )
+            targets = batch['targets'].to(DEVICE)
+            target_lengths = batch['target_lengths'].to(DEVICE)
+
+            loss = criterion(log_probs, targets, input_lengths, target_lengths)
+            total_loss += loss.item()
+
+            preds = utils.decode_batch(log_probs, vocab, strategy=cfg.decode_strategy, beam_width=cfg.beam_width, lm_alpha=cfg.lm_alpha)
+            predictions.extend(preds)
+            ground_truths.extend(batch['labels'])
+            utils.write_ctc_predictions(pred_log, batch['image_ids'], preds)
+
+    cer, wer = utils.compute_word_and_cer(predictions, ground_truths, vocab)
+    print(f'Test Loss: {total_loss / max(1, len(test_loader)):.4f}')
+    print(f'Test CER: {cer:.4f}')
+    print(f'Test WER: {wer:.4f}')
 
 
-PAD_IDX = tokens['PAD_TOKEN']
-def generate_square_subsequent_mask(sz):
-    mask = (torch.triu(torch.ones((sz, sz), device=DEVICE)) == 1).transpose(0, 1)
-    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-    return mask
-
-
-
-# Variables for the models size, those are for a "base" architecture
-
-NUM_ENCODER_LAYERS = 6
-NUM_DECODER_LAYERS = 6
-EMB_SIZE = 768
-NHEAD = 8
-FFN_HID_DIM = 768
-
-
-
-# function to generate output sequence using greedy algorithm
-def greedy_decode(model, src, src_mask, max_len, start_symbol):
-    src = src.to(DEVICE)
-    src_mask = src_mask.to(DEVICE)
-
-
-    memory = transformer.encode(src, src_mask)
-    ys = torch.ones(1, 1).fill_(start_symbol).type(torch.long).to(DEVICE)
-    for i in range(max_len-1):
-        memory = memory.to(DEVICE)
-        tgt_mask = (generate_square_subsequent_mask(ys.size(0))
-                    .type(torch.bool)).to(DEVICE)
-        out = transformer.decode(ys, memory, tgt_mask)
-        out = out.transpose(0, 1)
-        prob = transformer.generator(out[:, -1])
-        _, next_word = torch.max(prob, dim=1)
-        next_word = next_word.item()
-
-        ys = torch.cat([ys,
-                        torch.ones(1, 1).type_as(src.data).fill_(next_word)], dim=0)
-        if next_word == 1:
-            break
-    return ys
-
-
-# function to recognize images into texts 
-def test_image(model: torch.nn.Module, src_imgs: str , tgt_size = 38):
-    transformer.eval()
-    batch_y=[]
-    for src in src_imgs:
-        src = src.view(1,3,image_size[0],image_size[1])
-        num_tokens = tgt_size
-        src_mask = (torch.zeros(num_tokens, num_tokens)).type(torch.bool)
-        tgt_tokens = greedy_decode(
-            transformer,  src, src_mask, max_len=num_tokens + 5, start_symbol=0).flatten()
-        batch_y.append(tgt_tokens)
-    return batch_y 
-
-
-
-# Define the ViT encoder
-vit_encoder = ViT(
-    image_size = image_size,
-    patch_size = patch_size,
-    num_classes = 1000,
-    dim = EMB_SIZE,  #1024
-    depth = NUM_ENCODER_LAYERS,  #6
-    heads = NHEAD,  #8
-    mlp_dim = 2048
-)
-
-
-transformer = Seq2SeqTransformer(NUM_ENCODER_LAYERS, NUM_DECODER_LAYERS, EMB_SIZE,
-                                 NHEAD, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE, FFN_HID_DIM,custom_encoder=vit_encoder,device=DEVICE,use_stn = train_type == 'stn')
-
-transformer = transformer.to(DEVICE)
-
-
-def test():
-    epoch = 0
-    transformer.eval()
-    losses = 0
-    folder_name = 'pred_logs/'+EXPERIMENT
-    if not os.path.exists(folder_name):
-        os.makedirs(folder_name)
-    file_prefix = folder_name+'/'+'test'+'_predict_seq.'
-    f = open(file_prefix+str(epoch)+'.log', 'a')
-    print('will iterate for ',len(testloader))
-    for i, (test_index, test_in, test_in_len, test_out) in tqdm(enumerate(testloader)):
-        
-        batch_y_pred = test_image(transformer,test_in)
-        
-        for ib in range(len(test_index)):
-            w = ''
-            y_pred = batch_y_pred[ib]
-            y_index = test_index[ib]
-            for c in y_pred[1:-1]:
-                w +=  ' '+str(int(c.item())-num_tokens)
-            f.write(y_index+' '+w+'\n')
-    f.close()
-
-    test_cer, test_wacc = count_cer('test',epoch,"pred_logs/"+EXPERIMENT)
-    print("Test CER: ",test_cer)
-    print("Test WACC: ",test_wacc)
-
-
-if __name__ == "__main__":
-
-    transformer.load_state_dict(torch.load(test_model))
-    test()
+if __name__ == '__main__':
+    main()

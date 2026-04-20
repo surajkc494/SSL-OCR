@@ -1,166 +1,93 @@
-import torch.utils.data as D
-import cv2
-import numpy as np
 import torch
-import htrAugmentor
+from torch.utils.data import DataLoader
+from functools import partial
+
+from dataset import TeluguOCRDataset, telugu_collate_fn
+from vocab import TeluguVocab
 from Config import Configs
 
 cfg = Configs().parse()
 
-baseDir = cfg.data_path
-OUTPUT_MAX_LEN  = cfg.max_text_len
-IMG_HEIGHT = cfg.img_height
-IMG_WIDTH = cfg.img_width
-TRAINTYPE = cfg.train_type
-
-
-def labelDictionary():
-    labels = [' ', '!', '"', '#', '&', "'", '(', ')', '*', '+', ',', '-', '.', '/','[',']','@','<','>','|','0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '?', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '_', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z']
-    letter2index = {label: n for n, label in enumerate(labels)}
-    index2letter = {v: k for k, v in letter2index.items()}
-    return len(labels), letter2index, index2letter
-
-num_classes, letter2index, index2letter = labelDictionary()
+# Legacy tokens kept for compatibility with pretrain/fine_tune scripts
 tokens = {'GO_TOKEN': 0, 'END_TOKEN': 1, 'PAD_TOKEN': 2}
-num_tokens = len(tokens.keys())
-
-class Get_words(D.Dataset):
-    def __init__(self, file_label, augmentation=True):
-        self.file_label = file_label
-        self.output_max_len = OUTPUT_MAX_LEN
-        self.augmentation = augmentation
-
-        self.transformer = htrAugmentor.augmentor
-
-    def __getitem__(self, index):
-        word = self.file_label[index]
-        img, img_width = self.readImage_keepRatio(word[0])
-        label, label_mask = self.label_padding(' '.join(word[1:]), num_tokens)
-        return word[0], img, img_width, label
-        
-    def __len__(self):
-        return len(self.file_label)
-
-    def readImage_keepRatio(self, file_name):
-        
-        url = baseDir + 'words/' + file_name.replace(',128','') + '.jpg'
-        img = cv2.imread(url, 0)
-        
-        try:
-            img.any()
-        except:
-            print('###!Cannot find image: ' + url)
-
-        rate = float(IMG_HEIGHT) / img.shape[0]
-        img = cv2.resize(img, (int(img.shape[1]*rate)+1, IMG_HEIGHT), interpolation=cv2.INTER_CUBIC) 
-        
-        if self.augmentation: # augmentation for training data used by the htrAugmentor
-            img_new = self.transformer(255-img)
-            if img_new.shape[0] != 0 and img_new.shape[1] != 0:
-                rate = float(IMG_HEIGHT) / img_new.shape[0]
-                img = cv2.resize(img_new, (int(img_new.shape[1]*rate)+1, IMG_HEIGHT), interpolation=cv2.INTER_CUBIC) 
-        img_width = img.shape[-1]
+num_tokens = len(tokens)
 
 
-        # if image superior than specified width then resize. If inferior, add zero padding to the image. 
-        if img_width > IMG_WIDTH:
-            outImg = cv2.resize(img, (IMG_WIDTH, IMG_HEIGHT), interpolation=cv2.INTER_AREA)
-            img_width = IMG_WIDTH
-        else:
-            outImg = np.zeros((IMG_HEIGHT, IMG_WIDTH), dtype='uint8')
-            outImg[:, :img_width] = img
-        outImg = outImg/255. #float64
-        outImg = outImg.astype('float32')
-        
-        # Transform to 3 channels and normalize
-        mean = [0.485, 0.456, 0.406]
-        std = [0.229, 0.224, 0.225]
-        outImgFinal = np.zeros([3, *outImg.shape])
-        for i in range(3):
-            outImgFinal[i] = (outImg - mean[i]) / std[i]
-        return outImgFinal, img_width
-
-    def label_padding(self, labels, num_tokens):
-        # labels = labels.replace("?","")
-        new_label_len = []
-        ll =  [int(i) for i in labels.split(' ')]
-        num = self.output_max_len - len(ll) - 2
-        new_label_len.append(len(ll)+2)
-        ll = np.array(ll) + num_tokens   
-        ll = list(ll)
-        ll = [tokens['GO_TOKEN']] + ll + [tokens['END_TOKEN']]
-        if not num == 0:
-            ll.extend([tokens['PAD_TOKEN']] * num) 
-
-        def make_weights(seq_lens, output_max_len):
-            new_out = []
-            for i in seq_lens:
-                ele = [1]*i + [0]*(output_max_len -i)
-                new_out.append(ele)
-            return new_out
-        return ll, make_weights(new_label_len, self.output_max_len)
-
-def loadData():
-    
-    gt_tr = 'train.txt'
-    gt_va = 'valid.txt'
-    gt_te = 'test.txt'
-    
-    with open(baseDir+gt_tr, 'r') as f_tr:
-        data_tr = f_tr.readlines()
-        file_label_tr = [i[:-1].split(' ') for i in data_tr]
-
-    with open(baseDir+gt_va, 'r') as f_va:
-        data_va = f_va.readlines()
-        file_label_va = [i[:-1].split(' ') for i in data_va]
-
-    with open(baseDir+gt_te, 'r') as f_te:
-        data_te = f_te.readlines()
-        file_label_te = [i[:-1].split(' ') for i in data_te]
+def labelDictionary(cfg_obj=None):
+    cfg_used = cfg_obj or cfg
+    vocab = TeluguVocab(cfg_used.vocab_file, normalization=cfg_used.unicode_norm)
+    return vocab.vocab_size, vocab.char2idx, vocab.idx2char
 
 
-    np.random.shuffle(file_label_tr)
-    data_train = Get_words(file_label_tr, augmentation= TRAINTYPE=='htr_Augm')
-    data_valid = Get_words(file_label_va, augmentation=False)
-    data_test = Get_words(file_label_te, augmentation=False)
-    
-    return data_train, data_valid, data_test
+def build_vocab(cfg_obj=None):
+    cfg_used = cfg_obj or cfg
+    return TeluguVocab(cfg_used.vocab_file, normalization=cfg_used.unicode_norm)
 
 
-def sort_batch(batch):
-    n_batch = len(batch)
-    train_index = []
-    train_in = []
-    train_in_len = []
-    train_out = []
-    for i in range(n_batch):
-        idx, img, img_width, label = batch[i]
+def loadData(cfg_obj=None):
+    cfg_used = cfg_obj or cfg
+    vocab = build_vocab(cfg_used)
+    train_ds = TeluguOCRDataset(
+        split_file=cfg_used.train_file,
+        image_dir=cfg_used.image_dir,
+        label_csv=cfg_used.labels_csv,
+        vocab=vocab,
+        img_height=cfg_used.img_height,
+        max_width=cfg_used.max_width,
+        augment=True,
+    )
+    valid_ds = TeluguOCRDataset(
+        split_file=cfg_used.val_file,
+        image_dir=cfg_used.image_dir,
+        label_csv=cfg_used.labels_csv,
+        vocab=vocab,
+        img_height=cfg_used.img_height,
+        max_width=cfg_used.max_width,
+        augment=False,
+    )
+    test_ds = TeluguOCRDataset(
+        split_file=cfg_used.test_file,
+        image_dir=cfg_used.image_dir,
+        label_csv=cfg_used.labels_csv,
+        vocab=vocab,
+        img_height=cfg_used.img_height,
+        max_width=cfg_used.max_width,
+        augment=False,
+    )
+    return train_ds, valid_ds, test_ds, vocab
 
-        train_index.append(idx)
-        train_in.append(img)
-        train_in_len.append(img_width)
-        train_out.append(label)
-    
-    train_index = np.array(train_index)
-    train_in = np.array(train_in, dtype='float32')
-    train_out = np.array(train_out, dtype='int64')
-    train_in_len = np.array(train_in_len, dtype='int64')
 
-    train_in = torch.from_numpy(train_in)
-    train_out = torch.from_numpy(train_out)
-    train_in_len = torch.from_numpy(train_in_len)
-
-    train_in_len, idx = train_in_len.sort(0, descending=True)
-    train_in = train_in[idx]
-    train_out = train_out[idx]
-    train_index = train_index[idx]
-    return train_index, train_in, train_in_len, train_out
-
-
-def all_data_loader(batch_size):
-    data_train, data_valid, data_test = loadData()
-    train_loader = torch.utils.data.DataLoader(data_train, collate_fn=sort_batch, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    valid_loader = torch.utils.data.DataLoader(data_valid, collate_fn=sort_batch, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    test_loader = torch.utils.data.DataLoader(data_test, collate_fn=sort_batch, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    return train_loader, valid_loader, test_loader
-
+def all_data_loader(cfg_obj=None, batch_size=None):
+    cfg_used = cfg_obj or cfg
+    batch_size = batch_size or cfg_used.batch_size
+    train_ds, valid_ds, test_ds, vocab = loadData(cfg_used)
+    collate = partial(
+        telugu_collate_fn,
+        patch_multiple=cfg_used.vit_patch_size,
+        max_width=cfg_used.max_width,
+    )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=cfg_used.num_workers,
+        pin_memory=True,
+        collate_fn=collate,
+    )
+    valid_loader = DataLoader(
+        valid_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=cfg_used.num_workers,
+        pin_memory=True,
+        collate_fn=collate,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=cfg_used.num_workers,
+        pin_memory=True,
+        collate_fn=collate,
+    )
+    return train_loader, valid_loader, test_loader, vocab

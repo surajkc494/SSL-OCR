@@ -6,17 +6,14 @@ import math
 from typing import Optional, Any
 from einops import rearrange
 
+
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-
 class PositionalEncoding(nn.Module):
-    def __init__(self,
-                 emb_size: int,
-                 dropout: float,
-                 maxlen: int = 5000):
-        super(PositionalEncoding, self).__init__()
-        den = torch.exp(- torch.arange(0, emb_size, 2)* math.log(10000) / emb_size)
+    def __init__(self, emb_size: int, dropout: float, maxlen: int = 5000):
+        super().__init__()
+        den = torch.exp(-torch.arange(0, emb_size, 2) * math.log(10000) / emb_size)
         pos = torch.arange(0, maxlen).reshape(maxlen, 1)
         pos_embedding = torch.zeros((maxlen, emb_size))
         pos_embedding[:, 0::2] = torch.sin(pos * den)
@@ -32,78 +29,104 @@ class PositionalEncoding(nn.Module):
 
 class TokenEmbedding(nn.Module):
     def __init__(self, vocab_size: int, emb_size):
-        super(TokenEmbedding, self).__init__()
+        super().__init__()
         self.embedding = nn.Embedding(vocab_size, emb_size)
         self.emb_size = emb_size
 
     def forward(self, tokens: Tensor):
         return self.embedding(tokens.long()) * math.sqrt(self.emb_size)
 
-# Seq2Seq Network
+
 class Seq2SeqTransformer(nn.Module):
-    def __init__(self,
-                 num_encoder_layers: int,
-                 num_decoder_layers: int,
-                 emb_size: int,
-                 nhead: int,
-                 src_vocab_size: int,
-                 tgt_vocab_size: int,
-                 dim_feedforward: int = 512,
-                 dropout: float = 0.1,
-                 custom_encoder: Optional[Any] = None,
-                 device = None,
-                 use_stn=False):
-        super(Seq2SeqTransformer, self).__init__()
-        self.transformer = Transformer(d_model=emb_size,
-                                       nhead=nhead,
-                                       num_encoder_layers=num_encoder_layers,
-                                       num_decoder_layers=num_decoder_layers,
-                                       dim_feedforward=dim_feedforward,
-                                       dropout=dropout,
-                                       batch_first = False,
-                                       custom_encoder=custom_encoder,
-                                       device = device,
-                                       use_stn=use_stn)
+    def __init__(
+        self,
+        num_encoder_layers: int,
+        num_decoder_layers: int,
+        emb_size: int,
+        nhead: int,
+        src_vocab_size: int,
+        tgt_vocab_size: int,
+        dim_feedforward: int = 512,
+        dropout: float = 0.1,
+        custom_encoder: Optional[Any] = None,
+        device=None,
+        use_stn=False,
+    ):
+        super().__init__()
+        self.transformer = Transformer(
+            d_model=emb_size,
+            nhead=nhead,
+            num_encoder_layers=num_encoder_layers,
+            num_decoder_layers=num_decoder_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=False,
+            custom_encoder=custom_encoder,
+            device=device,
+            use_stn=use_stn,
+        )
         self.generator = nn.Linear(emb_size, tgt_vocab_size)
         self.src_tok_emb = TokenEmbedding(src_vocab_size, emb_size)
         self.tgt_tok_emb = TokenEmbedding(tgt_vocab_size, emb_size)
-        self.positional_encoding = PositionalEncoding(
-            emb_size, dropout=dropout)
+        self.positional_encoding = PositionalEncoding(emb_size, dropout=dropout)
         self.use_stn = use_stn
 
-
-
-    def forward(self,
-                src: Tensor,
-                trg: Tensor,
-                src_mask: Tensor,
-                tgt_mask: Tensor,
-                src_padding_mask: Tensor,
-                tgt_padding_mask: Tensor,
-                memory_key_padding_mask: Tensor):
-        
+    def forward(
+        self,
+        src: Tensor,
+        trg: Tensor,
+        src_mask: Tensor,
+        tgt_mask: Tensor,
+        src_padding_mask: Tensor,
+        tgt_padding_mask: Tensor,
+        memory_key_padding_mask: Tensor,
+    ):
         tgt_emb = self.positional_encoding(self.tgt_tok_emb(trg))
 
-        outs = self.transformer(src, tgt_emb, src_mask, tgt_mask, None,
-                                src_padding_mask, tgt_padding_mask, memory_key_padding_mask)
+        outs = self.transformer(
+            src,
+            tgt_emb,
+            src_mask,
+            tgt_mask,
+            None,
+            src_padding_mask,
+            tgt_padding_mask,
+            memory_key_padding_mask,
+        )
         return self.generator(outs)
 
     def encode(self, src: Tensor, src_mask: Tensor):
-        # STN
-        if self.use_stn: 
+        if self.use_stn:
             src = self.transformer.stn(src)
         patches = self.transformer.to_patch(src)
         batch, num_patches, *_ = patches.shape
         tokens = self.transformer.patch_to_emb(patches)
-        tokens = tokens + self.transformer.encoder.pos_embedding[:, 1:(num_patches + 1)]
+        tokens = tokens + self.transformer.encoder.pos_embedding[:, 1 : (num_patches + 1)]
         encoded_tokens = self.transformer.encoder.transformer(tokens)
-        
+
         memory = self.transformer.enc_to_dec(encoded_tokens)
         memory = rearrange(memory, 'b t e -> t b e')
-
         return memory
 
     def decode(self, tgt: Tensor, memory: Tensor, tgt_mask: Tensor):
-        return self.transformer.decoder(self.positional_encoding(
-                          self.tgt_tok_emb(tgt)), memory,
-                          tgt_mask)
+        return self.transformer.decoder(
+            self.positional_encoding(self.tgt_tok_emb(tgt)), memory, tgt_mask
+        )
+
+
+class TeluguCTCModel(nn.Module):
+    """ViT encoder + linear CTC head producing [T, B, num_classes]."""
+
+    def __init__(self, vit_encoder: nn.Module, emb_size: int, num_classes: int):
+        super().__init__()
+        self.encoder = vit_encoder
+        self.classifier = nn.Linear(emb_size, num_classes)
+
+    def forward(self, images: Tensor) -> Tensor:
+        patches = self.encoder.to_patch_embedding(images)
+        bsz, num_patches, _ = patches.shape
+        patches = patches + self.encoder.pos_embedding[:, 1 : num_patches + 1]
+        patches = self.encoder.dropout(patches)
+        encoded = self.encoder.transformer(patches)
+        logits = self.classifier(encoded)
+        return logits.transpose(0, 1)
