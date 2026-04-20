@@ -3,6 +3,7 @@ import random
 
 import cv2
 import numpy as np
+
 import pandas as pd
 from PIL import Image
 import torch
@@ -81,6 +82,7 @@ class TeluguOCRDataset(Dataset):
         df = pd.read_csv(label_csv, encoding='utf-8')
         self.label_map = {
             vocab.normalize_text(str(row['image_id'])): vocab.normalize_text(str(row['text']))
+            str(row['image_id']).replace('\u200c', ''): str(row['text'])
             for _, row in df.iterrows()
         }
 
@@ -92,12 +94,19 @@ class TeluguOCRDataset(Dataset):
                     continue
                 parts = line.split()
                 image_id = vocab.normalize_text(parts[0])
+                image_id = parts[0].replace('\u200c', '')
                 target_indices = list(map(int, parts[1:]))
                 label = self.label_map.get(image_id, vocab.decode(target_indices))
                 image_path = os.path.join(image_dir, image_id + '.jpg')
                 self.samples.append((image_path, label, target_indices, image_id))
 
         self.train_aug = TeluguAugmentor()
+        self.train_aug = T.Compose(
+            [
+                T.RandomRotation(degrees=5, fill=255),
+                T.ColorJitter(brightness=0.2, contrast=0.2),
+            ]
+        )
 
     def __len__(self):
         return len(self.samples)
@@ -149,6 +158,13 @@ def telugu_collate_fn(batch, patch_multiple=16, max_width=None):
         img = item['image']
         if img.shape[2] > max_w:
             img = img[:, :, :max_w]
+def telugu_collate_fn(batch):
+    import torch.nn.functional as F
+
+    max_w = max(item['image'].shape[2] for item in batch)
+    images = []
+    for item in batch:
+        img = item['image']
         pad_w = max_w - img.shape[2]
         img = F.pad(img, (0, pad_w), value=-1.0)
         img = img.repeat(3, 1, 1)

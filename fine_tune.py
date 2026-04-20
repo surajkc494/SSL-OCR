@@ -39,6 +39,7 @@ def maybe_load_pretrained_encoder(model, ckpt_path):
 
 
 def run_eval(model, loader, criterion, vocab, cfg):
+def run_eval(model, loader, criterion, vocab):
     model.eval()
     losses = 0.0
     all_preds, all_gts = [], []
@@ -55,6 +56,7 @@ def run_eval(model, loader, criterion, vocab, cfg):
             losses += loss.item()
 
             all_preds.extend(utils.decode_batch(log_probs, vocab, strategy=cfg.decode_strategy, beam_width=cfg.beam_width, lm_alpha=cfg.lm_alpha))
+            all_preds.extend(utils.ctc_greedy_decode_batch(log_probs, vocab))
             all_gts.extend(batch['labels'])
     cer, wer = utils.compute_word_and_cer(all_preds, all_gts, vocab)
     return losses / max(1, len(loader)), cer, wer
@@ -63,6 +65,7 @@ def run_eval(model, loader, criterion, vocab, cfg):
 def main():
     cfg = Configs().parse()
     train_loader, valid_loader, _, vocab = all_data_loader(cfg_obj=cfg, batch_size=cfg.batch_size)
+    train_loader, valid_loader, _, vocab = all_data_loader(cfg.batch_size)
     utils.validate_split_file(cfg.train_file, vocab)
 
     model = build_model(cfg, vocab.vocab_size + 1).to(DEVICE)
@@ -78,6 +81,7 @@ def main():
         model.train()
         total = 0.0
         for step, batch in enumerate(tqdm(train_loader, desc=f'fine-tune epoch {epoch}', leave=False), start=1):
+        for batch in tqdm(train_loader, desc=f'fine-tune epoch {epoch}', leave=False):
             images = batch['images'].to(DEVICE)
             logits = model(images)
             log_probs = torch.log_softmax(logits, dim=-1)
@@ -94,6 +98,8 @@ def main():
                 break
 
         val_loss, val_cer, val_wer = run_eval(model, valid_loader, criterion, vocab, cfg)
+
+        val_loss, val_cer, val_wer = run_eval(model, valid_loader, criterion, vocab)
         print(
             f'Epoch {epoch}: train_loss={total/max(1,len(train_loader)):.4f} '
             f'val_loss={val_loss:.4f} CER={val_cer:.4f} WER={val_wer:.4f}'
