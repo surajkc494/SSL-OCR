@@ -94,6 +94,19 @@ class Transformer(Module):
 
         self.batch_first = batch_first
 
+    def to_patch_embedding(self, x: Tensor) -> Tensor:
+        """
+        Unified patch-embedding API for compatibility across OCR components.
+        Uses whichever patch projection attributes are available.
+        """
+        if hasattr(self, "to_patch") and hasattr(self, "patch_to_emb"):
+            return self.patch_to_emb(self.to_patch(x))
+        if hasattr(self, "to_patch_conv") and hasattr(self, "patch_to_emb"):
+            patches = self.to_patch_conv(x)
+            patches = patches.flatten(2).transpose(1, 2)
+            return self.patch_to_emb(patches)
+        raise AttributeError("Transformer has no valid patch embedding components")
+
     def forward(self, src: Tensor, tgt: Tensor, src_mask: Optional[Tensor] = None, tgt_mask: Optional[Tensor] = None,
                 memory_mask: Optional[Tensor] = None, src_key_padding_mask: Optional[Tensor] = None,
                 tgt_key_padding_mask: Optional[Tensor] = None, memory_key_padding_mask: Optional[Tensor] = None) -> Tensor:
@@ -507,12 +520,14 @@ def _get_clones(module, N):
 
 
 def _get_activation_fn(activation):
+    if callable(activation):
+        return activation
     if activation == "relu":
         return F.relu
     elif activation == "gelu":
         return F.gelu
 
-    raise RuntimeError("activation should be relu/gelu, not {}".format(activation))
+    raise RuntimeError("activation should be relu/gelu or callable, not {}".format(activation))
 
 
 

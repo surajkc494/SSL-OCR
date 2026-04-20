@@ -27,7 +27,7 @@ def build_model(cfg, num_classes):
     return TeluguCTCModel(vit_encoder=vit_encoder, emb_size=768, num_classes=num_classes)
 
 
-def run_eval(model, loader, criterion, vocab):
+def run_eval(model, loader, criterion, vocab, cfg):
     model.eval()
     losses = 0.0
     all_preds, all_gts = [], []
@@ -47,7 +47,7 @@ def run_eval(model, loader, criterion, vocab):
             loss = criterion(log_probs, targets, input_lengths, target_lengths)
             losses += loss.item()
 
-            preds = utils.ctc_greedy_decode_batch(log_probs, vocab)
+            preds = utils.decode_batch(log_probs, vocab, strategy=cfg.decode_strategy, beam_width=cfg.beam_width, lm_alpha=cfg.lm_alpha)
             all_preds.extend(preds)
             all_gts.extend(batch['labels'])
 
@@ -57,7 +57,7 @@ def run_eval(model, loader, criterion, vocab):
 
 def main():
     cfg = Configs().parse()
-    train_loader, valid_loader, _, vocab = all_data_loader(cfg.batch_size)
+    train_loader, valid_loader, _, vocab = all_data_loader(cfg_obj=cfg, batch_size=cfg.batch_size)
 
     utils.validate_split_file(cfg.train_file, vocab)
     utils.validate_split_file(cfg.val_file, vocab)
@@ -76,7 +76,7 @@ def main():
         model.train()
         running = 0.0
 
-        for batch in tqdm(train_loader, desc=f'train epoch {epoch}', leave=False):
+        for step, batch in enumerate(tqdm(train_loader, desc=f'train epoch {epoch}', leave=False), start=1):
             images = batch['images'].to(DEVICE)
             logits = model(images)
             log_probs = torch.log_softmax(logits, dim=-1)
@@ -94,9 +94,11 @@ def main():
             optimizer.step()
 
             running += loss.item()
+            if cfg.max_steps_per_epoch > 0 and step >= cfg.max_steps_per_epoch:
+                break
 
         train_loss = running / max(1, len(train_loader))
-        val_loss, val_cer, val_wer = run_eval(model, valid_loader, criterion, vocab)
+        val_loss, val_cer, val_wer = run_eval(model, valid_loader, criterion, vocab, cfg)
         print(
             f'Epoch {epoch}: train_loss={train_loss:.4f} '
             f'val_loss={val_loss:.4f} CER={val_cer:.4f} WER={val_wer:.4f}'

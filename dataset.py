@@ -1,4 +1,8 @@
 import os
+import random
+
+import cv2
+import numpy as np
 
 import pandas as pd
 from PIL import Image
@@ -6,6 +10,56 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
+
+
+class TeluguAugmentor:
+    def __init__(self):
+        self.rot = T.RandomRotation(degrees=5, fill=255)
+
+    @staticmethod
+    def _add_noise(img_np: np.ndarray, sigma_range=(4.0, 14.0)) -> np.ndarray:
+        sigma = random.uniform(*sigma_range)
+        noise = np.random.normal(0, sigma, img_np.shape).astype(np.float32)
+        out = img_np.astype(np.float32) + noise
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _blur(img_np: np.ndarray) -> np.ndarray:
+        if random.random() < 0.5:
+            k = random.choice([3, 5])
+            img_np = cv2.GaussianBlur(img_np, (k, k), sigmaX=0)
+        return img_np
+
+    @staticmethod
+    def _elastic(img_np: np.ndarray, alpha=8.0, sigma=3.5) -> np.ndarray:
+        h, w = img_np.shape[:2]
+        dx = np.random.rand(h, w).astype(np.float32) * 2 - 1
+        dy = np.random.rand(h, w).astype(np.float32) * 2 - 1
+        dx = cv2.GaussianBlur(dx, (0, 0), sigma) * alpha
+        dy = cv2.GaussianBlur(dy, (0, 0), sigma) * alpha
+
+        x, y = np.meshgrid(np.arange(w), np.arange(h))
+        map_x = (x + dx).astype(np.float32)
+        map_y = (y + dy).astype(np.float32)
+
+        return cv2.remap(
+            img_np,
+            map_x,
+            map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=255,
+        )
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        img = self.rot(img)
+        img_np = np.array(img)
+        img_np = self._blur(img_np)
+        if random.random() < 0.6:
+            img_np = self._add_noise(img_np)
+        if random.random() < 0.35:
+            img_np = self._elastic(img_np)
+        return Image.fromarray(img_np)
 
 
 class TeluguOCRDataset(Dataset):
@@ -27,6 +81,7 @@ class TeluguOCRDataset(Dataset):
 
         df = pd.read_csv(label_csv, encoding='utf-8')
         self.label_map = {
+            vocab.normalize_text(str(row['image_id'])): vocab.normalize_text(str(row['text']))
             str(row['image_id']).replace('\u200c', ''): str(row['text'])
             for _, row in df.iterrows()
         }
@@ -38,12 +93,14 @@ class TeluguOCRDataset(Dataset):
                 if not line:
                     continue
                 parts = line.split()
+                image_id = vocab.normalize_text(parts[0])
                 image_id = parts[0].replace('\u200c', '')
                 target_indices = list(map(int, parts[1:]))
                 label = self.label_map.get(image_id, vocab.decode(target_indices))
                 image_path = os.path.join(image_dir, image_id + '.jpg')
                 self.samples.append((image_path, label, target_indices, image_id))
 
+        self.train_aug = TeluguAugmentor()
         self.train_aug = T.Compose(
             [
                 T.RandomRotation(degrees=5, fill=255),
@@ -62,6 +119,16 @@ class TeluguOCRDataset(Dataset):
         new_w = max(1, int(w * self.img_height / h))
         img = img.resize((new_w, self.img_height), Image.BICUBIC)
 
+        # Preserve aspect ratio and avoid width distortion.
+        if img.width > self.max_width:
+            scale = self.max_width / float(img.width)
+            resized_h = max(1, int(round(img.height * scale)))
+            img = img.resize((self.max_width, resized_h), Image.BICUBIC)
+            pad_top = max(0, (self.img_height - resized_h) // 2)
+            canvas = Image.new('L', (self.max_width, self.img_height), color=255)
+            canvas.paste(img, (0, pad_top))
+            img = canvas
+
         if self.augment:
             img = self.train_aug(img)
 
@@ -77,6 +144,20 @@ class TeluguOCRDataset(Dataset):
         }
 
 
+def telugu_collate_fn(batch, patch_multiple=16, max_width=None):
+    import torch.nn.functional as F
+
+    max_w = max(item['image'].shape[2] for item in batch)
+    if max_width is not None:
+        max_w = min(max_w, max_width)
+    if patch_multiple and patch_multiple > 1:
+        max_w = ((max_w + patch_multiple - 1) // patch_multiple) * patch_multiple
+
+    images = []
+    for item in batch:
+        img = item['image']
+        if img.shape[2] > max_w:
+            img = img[:, :, :max_w]
 def telugu_collate_fn(batch):
     import torch.nn.functional as F
 
@@ -102,3 +183,7 @@ def telugu_collate_fn(batch):
         'target_lengths': target_lengths,
         'image_ids': image_ids,
     }
+
+
+# Backward-compatible alias.
+collate_fn = telugu_collate_fn

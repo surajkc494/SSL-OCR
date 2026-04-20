@@ -38,6 +38,7 @@ def maybe_load_pretrained_encoder(model, ckpt_path):
     print(f'Loaded encoder from {ckpt_path}. Missing={len(missing)} Unexpected={len(unexpected)}')
 
 
+def run_eval(model, loader, criterion, vocab, cfg):
 def run_eval(model, loader, criterion, vocab):
     model.eval()
     losses = 0.0
@@ -54,6 +55,7 @@ def run_eval(model, loader, criterion, vocab):
             loss = criterion(log_probs, targets, input_lengths, target_lengths)
             losses += loss.item()
 
+            all_preds.extend(utils.decode_batch(log_probs, vocab, strategy=cfg.decode_strategy, beam_width=cfg.beam_width, lm_alpha=cfg.lm_alpha))
             all_preds.extend(utils.ctc_greedy_decode_batch(log_probs, vocab))
             all_gts.extend(batch['labels'])
     cer, wer = utils.compute_word_and_cer(all_preds, all_gts, vocab)
@@ -62,6 +64,7 @@ def run_eval(model, loader, criterion, vocab):
 
 def main():
     cfg = Configs().parse()
+    train_loader, valid_loader, _, vocab = all_data_loader(cfg_obj=cfg, batch_size=cfg.batch_size)
     train_loader, valid_loader, _, vocab = all_data_loader(cfg.batch_size)
     utils.validate_split_file(cfg.train_file, vocab)
 
@@ -77,6 +80,7 @@ def main():
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         total = 0.0
+        for step, batch in enumerate(tqdm(train_loader, desc=f'fine-tune epoch {epoch}', leave=False), start=1):
         for batch in tqdm(train_loader, desc=f'fine-tune epoch {epoch}', leave=False):
             images = batch['images'].to(DEVICE)
             logits = model(images)
@@ -90,6 +94,10 @@ def main():
             loss.backward()
             optimizer.step()
             total += loss.item()
+            if cfg.max_steps_per_epoch > 0 and step >= cfg.max_steps_per_epoch:
+                break
+
+        val_loss, val_cer, val_wer = run_eval(model, valid_loader, criterion, vocab, cfg)
 
         val_loss, val_cer, val_wer = run_eval(model, valid_loader, criterion, vocab)
         print(

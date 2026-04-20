@@ -29,7 +29,7 @@ def build_model(cfg, num_classes):
 
 def main():
     cfg = Configs().parse()
-    _, _, test_loader, vocab = all_data_loader(cfg.batch_size)
+    _, _, test_loader, vocab = all_data_loader(cfg_obj=cfg, batch_size=cfg.batch_size)
 
     num_classes = vocab.vocab_size + 1
     model = build_model(cfg, num_classes).to(DEVICE)
@@ -66,7 +66,7 @@ def main():
             loss = criterion(log_probs, targets, input_lengths, target_lengths)
             total_loss += loss.item()
 
-            preds = utils.ctc_greedy_decode_batch(log_probs, vocab)
+            preds = utils.decode_batch(log_probs, vocab, strategy=cfg.decode_strategy, beam_width=cfg.beam_width, lm_alpha=cfg.lm_alpha)
             predictions.extend(preds)
             ground_truths.extend(batch['labels'])
             utils.write_ctc_predictions(pred_log, batch['image_ids'], preds)

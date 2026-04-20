@@ -16,6 +16,8 @@ class Configs:
         self.parser.add_argument('--val_file', type=str, default='valid.txt')
         self.parser.add_argument('--test_file', type=str, default='test.txt')
 
+        self.parser.add_argument('--unicode_norm', type=str, default='NFC', choices=['NFC', 'NFKC'])
+
         self.parser.add_argument('--img_height', type=int, default=64)
         self.parser.add_argument('--img_width', type=int, default=512)
         self.parser.add_argument('--max_width', type=int, default=512)
@@ -27,10 +29,16 @@ class Configs:
         self.parser.add_argument('--batch_size', type=int, default=32)
         self.parser.add_argument('--num_workers', type=int, default=4)
         self.parser.add_argument('--epochs', type=int, default=100)
+        self.parser.add_argument('--max_steps_per_epoch', type=int, default=0, help='0 = full epoch')
         self.parser.add_argument('--lr', type=float, default=1.5e-4)
         self.parser.add_argument('--weights_path', type=str, default='./weights/')
         self.parser.add_argument('--test_model', type=str, default='')
         self.parser.add_argument('--pretrained_encoder_path', type=str, default='')
+
+        # Decoder options
+        self.parser.add_argument('--decode_strategy', type=str, default='beam', choices=['greedy', 'beam'])
+        self.parser.add_argument('--beam_width', type=int, default=10)
+        self.parser.add_argument('--lm_alpha', type=float, default=0.0)
 
         # Auto-computed at runtime from vocab
         self.parser.add_argument('--num_classes', type=int, default=1246)
